@@ -1,3 +1,7 @@
+import sys
+
+sys.path.insert(0, '/home/yunkang/objaverse-xl/scripts/rendering')
+
 import glob
 import json
 import multiprocessing
@@ -34,7 +38,7 @@ def log_processed_object(csv_filename: str, *args) -> None:
     args = ",".join([str(arg) for arg in args])
     # log that this object was rendered successfully
     # saving locally to avoid excessive writes to the cloud
-    dirname = os.path.expanduser(f"~/.objaverse/logs/")
+    dirname = os.path.expanduser(f"/home/yunkang/objaverse-xl/data/logs/")
     os.makedirs(dirname, exist_ok=True)
     with open(os.path.join(dirname, csv_filename), "a", encoding="utf-8") as f:
         f.write(f"{time.time()},{args}\n")
@@ -98,6 +102,7 @@ def handle_found_object(
 
     Returns: True if the object was rendered successfully, False otherwise.
     """
+    print("FUNCTION: handle_found_object")
     save_uid = get_uid_from_str(file_identifier)
     args = f"--object_path '{local_path}' --num_renders {num_renders}"
 
@@ -112,9 +117,7 @@ def handle_found_object(
     elif isinstance(gpu_devices, int) and gpu_devices == 0:
         using_gpu = False
     else:
-        raise ValueError(
-            f"gpu_devices must be an int > 0, 0, or a list of ints. Got {gpu_devices}."
-        )
+        raise ValueError(f"gpu_devices must be an int > 0, 0, or a list of ints. Got {gpu_devices}.")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # get the target directory for the rendering job
@@ -125,9 +128,7 @@ def handle_found_object(
         # check for Linux / Ubuntu or MacOS
         if platform.system() == "Linux" and using_gpu:
             args += " --engine BLENDER_EEVEE"
-        elif platform.system() == "Darwin" or (
-            platform.system() == "Linux" and not using_gpu
-        ):
+        elif platform.system() == "Darwin" or (platform.system() == "Linux" and not using_gpu):
             # As far as I know, MacOS does not support BLENER_EEVEE, which uses GPU
             # rendering. Generally, I'd only recommend using MacOS for debugging and
             # small rendering jobs, since CYCLES is much slower than BLENDER_EEVEE.
@@ -140,7 +141,9 @@ def handle_found_object(
             args += " --only_northern_hemisphere"
 
         # get the command to run
-        command = f"blender-3.2.2-linux-x64/blender --background --python blender_script.py -- {args}"
+        # command = f"blender-3.2.2-linux-x64/blender --background --python blender_script.py -- {args}"
+        command = f"blender-3.2.2-linux-x64/blender --background --python blender_custom_script.py -- {args}"
+        print(command)
         if using_gpu:
             command = f"export DISPLAY=:0.{gpu_i} && {command}"
 
@@ -157,14 +160,8 @@ def handle_found_object(
         png_files = glob.glob(os.path.join(target_directory, "*.png"))
         metadata_files = glob.glob(os.path.join(target_directory, "*.json"))
         npy_files = glob.glob(os.path.join(target_directory, "*.npy"))
-        if (
-            (len(png_files) != num_renders)
-            or (len(npy_files) != num_renders)
-            or (len(metadata_files) != 1)
-        ):
-            logger.error(
-                f"Found object {file_identifier} was not rendered successfully!"
-            )
+        if (len(png_files) != num_renders) or (len(npy_files) != num_renders) or (len(metadata_files) != 1):
+            logger.error(f"Found object {file_identifier} was not rendered successfully!")
             if failed_log_file is not None:
                 log_processed_object(
                     failed_log_file,
@@ -186,9 +183,7 @@ def handle_found_object(
 
         # Make a zip of the target_directory.
         # Keeps the {save_uid} directory structure when unzipped
-        with zipfile.ZipFile(
-            f"{target_directory}.zip", "w", zipfile.ZIP_DEFLATED
-        ) as ziph:
+        with zipfile.ZipFile(f"{target_directory}.zip", "w", zipfile.ZIP_DEFLATED) as ziph:
             zipdir(target_directory, ziph)
 
         # move the zip to the render_dir
@@ -335,17 +330,17 @@ def handle_missing_object(
 
 def get_example_objects() -> pd.DataFrame:
     """Returns a DataFrame of example objects to use for debugging."""
-    return pd.read_json("example-objects.json", orient="records")
+    return pd.read_json("/home/yunkang/objaverse-xl/scripts/rendering/example-objects.json", orient="records")
 
 
 def render_objects(
-    render_dir: str = "~/.objaverse",
-    download_dir: Optional[str] = None,
-    num_renders: int = 12,
+    render_dir: str = "/home/yunkang/objaverse-xl/data",
+    download_dir: Optional[str] = '/home/yunkang/objaverse-xl/data',
+    num_renders: int = 100,
     processes: Optional[int] = None,
-    save_repo_format: Optional[Literal["zip", "tar", "tar.gz", "files"]] = None,
+    save_repo_format: Optional[Literal["zip", "tar", "tar.gz", "files"]] = "zip",
     only_northern_hemisphere: bool = False,
-    render_timeout: int = 300,
+    render_timeout: int = 300000,
     gpu_devices: Optional[Union[int, List[int]]] = None,
 ) -> None:
     """Renders objects in the Objaverse-XL dataset with Blender
@@ -378,17 +373,11 @@ def render_objects(
         None
     """
     if platform.system() not in ["Linux", "Darwin"]:
-        raise NotImplementedError(
-            f"Platform {platform.system()} is not supported. Use Linux or MacOS."
-        )
+        raise NotImplementedError(f"Platform {platform.system()} is not supported. Use Linux or MacOS.")
     if download_dir is None and save_repo_format is not None:
-        raise ValueError(
-            f"If {save_repo_format=} is not None, {download_dir=} must be specified."
-        )
+        raise ValueError(f"If {save_repo_format=} is not None, {download_dir=} must be specified.")
     if download_dir is not None and save_repo_format is None:
-        logger.warning(
-            f"GitHub repos will not save. While {download_dir=} is specified, {save_repo_format=} None."
-        )
+        logger.warning(f"GitHub repos will not save. While {download_dir=} is specified, {save_repo_format=} None.")
 
     # get the gpu devices to use
     parsed_gpu_devices: Union[int, List[int]] = 0
@@ -400,7 +389,11 @@ def render_objects(
         processes = multiprocessing.cpu_count() * 3
 
     # get the objects to render
-    objects = get_example_objects()
+    # objects = get_example_objects()
+    annotations = oxl.get_annotations(download_dir="/home/yunkang/objaverse-xl/data")
+    download_quantity = 10  # 例如，下载10条记录
+    objects = annotations[annotations['source'] == 'smithsonian'].head(download_quantity).reset_index(drop=True)
+
     objects.iloc[0]["fileIdentifier"]
     objects = objects.copy()
     logger.info(f"Provided {len(objects)} objects to render.")
@@ -419,11 +412,11 @@ def render_objects(
     # filter out the already rendered objects
     objects["saveUid"] = objects["fileIdentifier"].apply(get_uid_from_str)
     objects = objects[~objects["saveUid"].isin(saved_ids)]
-    objects = objects.reset_index(drop=True)
+    # objects = objects.reset_index(drop=True)
     logger.info(f"Rendering {len(objects)} new objects.")
 
-    # shuffle the objects
-    objects = objects.sample(frac=1).reset_index(drop=True)
+    # # shuffle the objects
+    # objects = objects.sample(frac=1).reset_index(drop=True)
 
     oxl.download_objects(
         objects=objects,

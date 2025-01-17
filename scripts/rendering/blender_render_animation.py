@@ -12,6 +12,18 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
+import debugpy
+
+# 设置调试服务器监听地址和端口
+debugpy.listen(("0.0.0.0", 5678))
+print("等待调试器连接...")
+
+# 阻塞，直到调试器连接
+debugpy.wait_for_client()
+
+# 可选：在此处设置断点
+debugpy.breakpoint()
+
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "obj": bpy.ops.import_scene.obj,
     "glb": bpy.ops.import_scene.gltf,
@@ -45,7 +57,7 @@ def reset_cameras() -> None:
     scene.camera = new_camera
 
 
-def sample_point_on_sphere(radius: float) -> Tuple[float, float, float]:
+def sample_point_on_sphere(radius: float, azimuth: float = None) -> Tuple[float, float, float]:
     """Samples a point on a sphere with the given radius.
 
     Args:
@@ -54,8 +66,10 @@ def sample_point_on_sphere(radius: float) -> Tuple[float, float, float]:
     Returns:
         Tuple[float, float, float]: A point on the sphere.
     """
-    theta = random.random() * 2 * math.pi
-    phi = math.acos(2 * random.random() - 1)
+    theta = random.random() * 2 * math.pi if azimuth is None else azimuth
+    phi = None
+    while phi is None or phi < np.pi / 4 or phi > np.pi / 2:
+        phi = math.acos(2 * random.random() - 1)
     return (
         radius * math.sin(phi) * math.cos(theta),
         radius * math.sin(phi) * math.sin(theta),
@@ -95,9 +109,10 @@ def _sample_spherical(
 def randomize_camera(
     radius_min: float = 1.5,
     radius_max: float = 2.2,
-    maxz: float = 2.2,
-    minz: float = -2.2,
+    maxz: float = 1.2,
+    minz: float = -1.2,
     only_northern_hemisphere: bool = False,
+    azimuth: float = None,
 ) -> bpy.types.Object:
     """Randomizes the camera location and rotation inside of a spherical shell.
 
@@ -115,8 +130,11 @@ def randomize_camera(
     Returns:
         bpy.types.Object: The camera object.
     """
-
-    x, y, z = _sample_spherical(radius_min=radius_min, radius_max=radius_max, maxz=maxz, minz=minz)
+    if azimuth is not None:
+        radius = np.random.uniform(radius_min, radius_max, 1)
+        x, y, z = sample_point_on_sphere(radius=radius[0], azimuth=azimuth)
+    else:
+        x, y, z = _sample_spherical(radius_min=radius_min, radius_max=radius_max, maxz=maxz, minz=minz)
     camera = bpy.data.objects["Camera"]
 
     # only positive z
@@ -410,6 +428,39 @@ def get_3x4_RT_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
     return RT
 
 
+def get_4x4_perspective_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
+    """Returns the 4x4 perspective matrix from the given camera."""
+    # Access the camera data
+    cam_data = cam.data
+
+    # Aspect ratio
+    scene = bpy.context.scene
+    render = scene.render
+    aspect_ratio = render.resolution_x / render.resolution_y
+
+    # Field of View (in radians)
+    fovy = cam_data.angle
+    fovx = 2 * np.arctan(np.tan(fovy / 2) * aspect_ratio)
+
+    # Near and Far clipping planes
+    near = cam_data.clip_start
+    far = cam_data.clip_end
+
+    # Perspective matrix components
+    f = 1 / np.tan(fovy / 2)
+    matrix = Matrix(((f / aspect_ratio, 0, 0, 0), (0, f, 0, 0), (0, 0, (far + near) / (near - far), (2 * far * near) / (near - far)), (0, 0, -1, 0)))
+
+    return cam.calc_matrix_camera(
+        bpy.context.evaluated_depsgraph_get(),
+        x=render.resolution_x,
+        y=render.resolution_y,
+        scale_x=render.pixel_aspect_x,
+        scale_y=render.pixel_aspect_y,
+    )
+
+    return matrix
+
+
 def delete_invisible_objects() -> None:
     """Deletes all invisible objects in the scene.
 
@@ -463,11 +514,24 @@ def normalize_scene() -> None:
     bbox_min, bbox_max = scene_bbox()
     offset = -(bbox_min + bbox_max) / 2
     for obj in get_scene_root_objects():
+        print(obj.name)
         obj.matrix_world.translation += offset
     bpy.ops.object.select_all(action="DESELECT")
 
     # unparent the camera
     bpy.data.objects["Camera"].parent = None
+
+
+def has_global_motion(thresh) -> bool:
+    bbox_min, bbox_max = scene_bbox()
+    offset = -(bbox_min + bbox_max) / 2
+    return max(offset) > thresh
+
+
+def has_large_scale_change(thresh) -> bool:
+    bbox_min, bbox_max = scene_bbox()
+    scale = 1 / max(bbox_max - bbox_min)
+    return scale > thresh
 
 
 def delete_missing_textures() -> Dict[str, Any]:
@@ -716,11 +780,34 @@ class MetadataExtractor:
         }
 
 
+def duplicate_and_apply_modifiers(frame):
+    bpy.context.scene.frame_set(frame)
+    bpy.ops.object.duplicate(linked=False, mode='TRANSLATION')
+    duplicated_obj = bpy.context.active_object
+
+    # Apply all Armature modifiers
+    for modifier in duplicated_obj.modifiers:
+        if modifier.type == 'ARMATURE':
+            bpy.ops.object.modifier_apply(modifier=modifier.name)
+
+    return duplicated_obj
+
+
 def render_object(
     object_file: str,
     num_renders: int,
     only_northern_hemisphere: bool,
     output_dir: str,
+    render_animation: bool = False,
+    max_n_frames: int = None,
+    render: bool = True,
+    export_mesh: bool = False,
+    filter_object_with_global_motion: bool = False,
+    global_motion_threshold: float = 0.5,
+    filter_object_with_large_scale_change: bool = False,
+    large_scale_change_threshold: float = 0.5,
+    uniform_azimuth: bool = False,
+    needed_actions: List[str] = None,
 ) -> None:
     """Saves rendered images with its camera matrix and metadata of the object.
 
@@ -738,6 +825,10 @@ def render_object(
         None
     """
     os.makedirs(output_dir, exist_ok=True)
+    if not render and not export_mesh:
+        raise ValueError("At least one of render or export_mesh must be True.")
+    if not render:
+        num_renders = 1
 
     # load the object
     if object_file.endswith(".blend"):
@@ -754,12 +845,12 @@ def render_object(
     cam.data.sensor_width = 32
 
     # Set up camera constraints
-    cam_constraint = cam.constraints.new(type="TRACK_TO")
-    cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
-    cam_constraint.up_axis = "UP_Y"
-    empty = bpy.data.objects.new("Empty", None)
-    scene.collection.objects.link(empty)
-    cam_constraint.target = empty
+    # cam_constraint = cam.constraints.new(type="TRACK_TO")
+    # cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
+    # cam_constraint.up_axis = "UP_Y"
+    # empty = bpy.data.objects.new("Empty", None)
+    # scene.collection.objects.link(empty)
+    # cam_constraint.target = empty
 
     # Extract the metadata. This must be done before normalizing the scene to get
     # accurate bounding box information.
@@ -771,7 +862,8 @@ def render_object(
         # don't delete missing textures on usdz files, lots of them are embedded
         missing_textures = None
     else:
-        missing_textures = delete_missing_textures()
+        # missing_textures = delete_missing_textures()
+        missing_textures = None
     metadata["missing_textures"] = missing_textures
 
     # possibly apply a random color to all objects
@@ -794,20 +886,120 @@ def render_object(
     # randomize the lighting
     randomize_lighting()
 
+    if render:
+        perspective_matrix = get_4x4_perspective_matrix_from_blender(bpy.data.objects["Camera"])
+        perspective_matrix_path = os.path.join(output_dir, f"intrinsic.npy")
+        np.save(perspective_matrix_path, perspective_matrix)
+
+    all_animations = set()  # 初始化一个空集合 all_animations
+    for obj in bpy.data.objects:  # 遍历Blender场景中的所有对象
+        if obj.animation_data and obj.animation_data.action:
+            action = obj.animation_data.action
+            if not obj.animation_data.nla_tracks.get(action.name.split("_")[0]):
+                new_track = obj.animation_data.nla_tracks.new()
+                new_track.name = action.name.split("_")[0]
+                new_strip = new_track.strips.new(action.name, int(action.frame_start), action)
+            obj.animation_data.action = None
+        if obj.animation_data and obj.animation_data.nla_tracks:
+            all_animations.update([track.name for track in obj.animation_data.nla_tracks])
+
+    print(all_animations)
+    if needed_actions is not None:
+        all_animations = all_animations.intersection(set(needed_actions))
+
+    for track_name in all_animations:
+        os.makedirs(os.path.join(output_dir, track_name), exist_ok=True)
+
     # render the images
+    all_excluded = True
     for i in range(num_renders):
         # set camera
-        camera = randomize_camera(only_northern_hemisphere=only_northern_hemisphere)
+        camera = randomize_camera(
+            only_northern_hemisphere=only_northern_hemisphere,
+            azimuth=np.pi * 2 * i / num_renders if uniform_azimuth else None,
+        )
 
-        # render the image
-        render_path = os.path.join(output_dir, f"{i:03d}.png")
-        scene.render.filepath = render_path
-        bpy.ops.render.render(write_still=True)
+        if render_animation:
+            if not all_animations:
+                break
+            for track_name in all_animations.copy():
+                current_animation_output_dir = os.path.join(output_dir, track_name)
+
+                frame_start, frame_end = 10000000, -10000000
+                for obj in bpy.data.objects:
+                    if obj.animation_data:
+                        track = obj.animation_data.nla_tracks.get(track_name)
+                        if track and track.strips:
+                            frame_start = min(frame_start, min([strip.frame_start for strip in track.strips]))
+                            frame_end = max(frame_end, max([strip.frame_end for strip in track.strips]))
+                frame_start, frame_end = int(frame_start), int(frame_end)
+                if frame_end - frame_start < 10:
+                    os.removedirs(current_animation_output_dir)
+                    continue
+
+                for obj in bpy.data.objects:
+                    if obj.animation_data:
+                        for obj_track in obj.animation_data.nla_tracks:
+                            obj_track.mute = obj_track.name != track_name
+
+                if i == 0 and (filter_object_with_global_motion or filter_object_with_large_scale_change):
+                    delta = (frame_end - frame_start) // 4
+                    excluded = False
+                    for frame_idx in [frame_start + delta, frame_start + 2 * delta, frame_end - delta, frame_end - 1]:
+                        scene.frame_set(frame_idx)
+                        if filter_object_with_global_motion or filter_object_with_large_scale_change:
+                            if has_global_motion(global_motion_threshold) or has_large_scale_change(large_scale_change_threshold):
+                                print(has_global_motion(global_motion_threshold), has_large_scale_change(large_scale_change_threshold))
+                                os.removedirs(current_animation_output_dir)
+                                excluded = True
+                                all_animations.remove(track_name)
+                                break
+
+                    if excluded:
+                        continue
+
+                all_excluded = False
+
+                if max_n_frames is not None and frame_end - frame_start > max_n_frames:
+                    every_n_frames = int((frame_end - frame_start) // max_n_frames)
+                else:
+                    every_n_frames = 1
+
+                for frame_idx in range(frame_start, frame_end, every_n_frames):
+                    scene.frame_set(frame_idx)
+
+                    if render:
+                        render_path = os.path.join(current_animation_output_dir, f"{i:03d}_{frame_idx:03d}.png")
+                        scene.render.filepath = render_path
+                        bpy.ops.render.render(write_still=True)
+
+                    if i == 0 and export_mesh:
+                        mesh_path = os.path.join(current_animation_output_dir, f"model_{frame_idx:03d}.obj")
+                        if not os.path.exists(mesh_path):
+                            bpy.ops.export_scene.obj(
+                                filepath=mesh_path,
+                                use_triangles=True,
+                                use_materials=False,
+                                group_by_object=False,
+                                keep_vertex_order=True,
+                                axis_up="Z",
+                                axis_forward="Y",
+                            )
+
+        else:
+            # render the image
+            if render:
+                render_path = os.path.join(output_dir, f"{i:03d}.png")
+                scene.render.filepath = render_path
+                bpy.ops.render.render(write_still=True)
 
         # save camera RT matrix
-        rt_matrix = get_3x4_RT_matrix_from_blender(camera)
-        rt_matrix_path = os.path.join(output_dir, f"{i:03d}.npy")
-        np.save(rt_matrix_path, rt_matrix)
+        if render:
+            rt_matrix = get_3x4_RT_matrix_from_blender(camera)
+            rt_matrix_path = os.path.join(output_dir, f"{i:03d}.npy")
+            np.save(rt_matrix_path, rt_matrix)
+
+    return all_excluded
 
 
 if __name__ == "__main__":
@@ -817,6 +1009,15 @@ if __name__ == "__main__":
     parser.add_argument("--engine", type=str, default="BLENDER_EEVEE", choices=["CYCLES", "BLENDER_EEVEE"])
     parser.add_argument("--only_northern_hemisphere", action="store_true", help="Only render the northern hemisphere of the object.", default=False)
     parser.add_argument("--num_renders", type=int, default=12, help="Number of renders to save of the object.")
+    parser.add_argument("--max_n_frames", type=int, default=None, help="Maximum number of frames to render for animations.")
+    parser.add_argument("--filter_object_with_global_motion", action="store_true", help="Whether to exclude objects with large global motion.")
+    parser.add_argument("--global_motion_threshold", type=float, default=0.3, help="The threshold for the center of the normalized scene to be considered as moving.")
+    parser.add_argument("--filter_object_with_large_scale_change", action="store_true", help="Whether to exclude objects with large scale changes.")
+    parser.add_argument("--large_scale_change_threshold", type=float, default=1.5, help="The threshold for the scale of the normalized scene to be considered as changing.")
+    parser.add_argument("--render", action="store_true", help="Whether to render the animation.")
+    parser.add_argument("--export_mesh", action="store_true", help="Whether to export the animation as a sequence of aligned OBJ files.")
+    parser.add_argument("--uniform_azimuth", action="store_true", help="Whether to render the object from uniformly spaced azimuth angles.")
+    parser.add_argument("--actions", type=str, nargs="+", default=None, help="If not None, only render the animations with the given names.")
     argv = sys.argv[sys.argv.index("--") + 1 :]
     args = parser.parse_args(argv)
 
@@ -846,9 +1047,27 @@ if __name__ == "__main__":
     bpy.context.preferences.addons["cycles"].preferences.compute_device_type = "CUDA"  # or "OPENCL"
 
     # Render the images
-    render_object(
+    all_excluded = render_object(
         object_file=args.object_path,
         num_renders=args.num_renders,
         only_northern_hemisphere=args.only_northern_hemisphere,
         output_dir=args.output_dir,
+        render_animation=True,
+        max_n_frames=args.max_n_frames,
+        render=args.render,
+        export_mesh=args.export_mesh,
+        filter_object_with_global_motion=args.filter_object_with_global_motion,
+        global_motion_threshold=args.global_motion_threshold,
+        filter_object_with_large_scale_change=args.filter_object_with_large_scale_change,
+        large_scale_change_threshold=args.large_scale_change_threshold,
+        uniform_azimuth=args.uniform_azimuth,
+        needed_actions=args.actions,
     )
+
+    # Save a flag
+    if all_excluded:
+        with open(os.path.join(args.output_dir, "excluded.flag"), "w") as f:
+            f.write("Excluded")
+    else:
+        with open(os.path.join(args.output_dir, "rendered.flag"), "w") as f:
+            f.write("Rendered")

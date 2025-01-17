@@ -1,16 +1,21 @@
 """Blender script to render images of 3D models."""
 
+from ast import literal_eval
+import sys
 import argparse
 import json
 import math
 import os
 import random
-import sys
+
+import time
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Set, Tuple
 
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
+import mathutils
+from math import radians
 
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "obj": bpy.ops.import_scene.obj,
@@ -126,6 +131,57 @@ def randomize_camera(
     camera.location = Vector(np.array([x, y, z]))
 
     direction = -camera.location
+    rot_quat = direction.to_track_quat("-Z", "Y")
+    camera.rotation_euler = rot_quat.to_euler()
+
+    return camera
+
+
+def randomize_camera_position(
+    radius_min: float = 3.0,
+    radius_max: float = 4.0,
+    maxz: float = 4.0,
+    minz: float = -4.0,
+    only_northern_hemisphere: bool = False,
+) -> Vector:
+    x, y, z = _sample_spherical(radius_min=radius_min, radius_max=radius_max, maxz=maxz, minz=minz)
+    if only_northern_hemisphere:
+        z = abs(z)
+    return Vector((x, y, z))
+
+
+def update_camera(initial_loc: Vector, target_loc: Vector, i: int, num_renders: int) -> bpy.types.Object:
+    """
+    更新相机的位置和旋转，使其在初始位置和目标位置之间线性插值。
+
+    Args:
+        initial_loc (Vector): 初始相机位置。
+        target_loc (Vector): 目标相机位置。
+        i (int): 当前渲染循环的索引。
+        num_renders (int): 总的渲染次数。
+
+    Returns:
+        bpy.types.Object: 更新后的相机对象。
+    """
+    if num_renders <= 1:
+        t = 1.0
+    else:
+        t = i / (num_renders - 1)
+
+    # 线性插值计算新位置
+    new_location = initial_loc.lerp(target_loc, t)
+
+    # 获取相机对象
+    camera = bpy.data.objects["Camera"]
+
+    # 更新相机位置
+    camera.location = new_location
+
+    # 计算指向原点的方向
+    direction = Vector((0, 0, 0)) - new_location
+    direction.normalize()
+
+    # 计算旋转四元数，使相机朝向原点
     rot_quat = direction.to_track_quat("-Z", "Y")
     camera.rotation_euler = rot_quat.to_euler()
 
@@ -305,9 +361,9 @@ def load_object(object_path: str) -> None:
         addon_name = "io_scene_usdz"
         bpy.ops.preferences.addon_enable(module=addon_name)
         # import the usdz
-        from io_scene_usdz.import_usdz import import_usdz
+        # from io_scene_usdz.import_usdz import import_usdz
 
-        import_usdz(context, filepath=object_path, materials=True, animations=True)
+        # import_usdz(context, filepath=object_path, materials=True, animations=True)
         return None
 
     # load from existing import functions
@@ -380,8 +436,8 @@ def get_scene_meshes() -> Generator[bpy.types.Object, None, None]:
             yield obj
 
 
-def get_3x4_RT_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
-    """Returns the 3x4 RT matrix from the given camera.
+def get_3x4_RT_matrix_from_blender(cam: bpy.types.Object):
+    """从给定的Blender摄像机对象中返回两个3x4的RT矩阵。
 
     Taken from Zero123, which in turn was taken from
     https://github.com/panmari/stanford-shapenet-renderer/blob/master/render_blender.py
@@ -390,7 +446,7 @@ def get_3x4_RT_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
         cam (bpy.types.Object): The camera object.
 
     Returns:
-        Matrix: The 3x4 RT matrix from the given camera.
+        Tuple[Matrix, Matrix]: 第一个是相机的RT矩阵，第二个是世界的RT矩阵。
     """
     # Use matrix_world instead to account for all constraints
     location, rotation = cam.matrix_world.decompose()[0:2]
@@ -400,13 +456,50 @@ def get_3x4_RT_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
     T_world2bcam = -1 * R_world2bcam @ location
 
     # put into 3x4 matrix
-    RT = Matrix(
+    rt_matrix_camera = Matrix(
         (
             R_world2bcam[0][:] + (T_world2bcam[0],),
             R_world2bcam[1][:] + (T_world2bcam[1],),
             R_world2bcam[2][:] + (T_world2bcam[2],),
         )
     )
+
+    # 为了构建从摄像机到世界的矩阵，使用原始旋转矩阵和位置
+    # location, rotation = cam.matrix_world
+    R_cam_to_world = rotation.to_matrix()
+    T_cam_to_world = location
+
+    # 构建从摄像机到世界的3x4 RT矩阵
+    rt_matrix_world = Matrix(
+        (
+            R_cam_to_world[0][:] + (T_cam_to_world[0],),
+            R_cam_to_world[1][:] + (T_cam_to_world[1],),
+            R_cam_to_world[2][:] + (T_cam_to_world[2],),
+        )
+    )
+
+    return rt_matrix_camera, rt_matrix_world
+
+
+def get_3x4_RT_world_matrix_from_blender(cam: bpy.types.Object) -> Matrix:
+    # 分解世界矩阵为位置、旋转、缩放
+    loc, rot = cam.matrix_world.decompose()[0:2]
+
+    # 获取旋转矩阵 (3x3)
+    R = rot.to_matrix()
+
+    # 获取平移向量
+    t = loc
+
+    # 构建 3x4 外参矩阵
+    RT = Matrix(
+        (
+            R[0][:] + (t[0],),
+            R[1][:] + (t[1],),
+            R[2][:] + (t[2],),
+        )
+    )
+
     return RT
 
 
@@ -716,7 +809,159 @@ class MetadataExtractor:
         }
 
 
-def render_object(
+def center_object_to_origin(obj):
+    # 选择对象并确保处于对象模式
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    # 计算几何中心
+    bbox_corners = [obj.matrix_world @ mathutils.Vector(corner) for corner in obj.bound_box]
+    min_corner = mathutils.Vector((min([v.x for v in bbox_corners]), min([v.y for v in bbox_corners]), min([v.z for v in bbox_corners])))
+    max_corner = mathutils.Vector((max([v.x for v in bbox_corners]), max([v.y for v in bbox_corners]), max([v.z for v in bbox_corners])))
+    center = (min_corner + max_corner) / 2
+
+    # 移动几何数据
+    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+    obj.location = (-center.x, -center.y, -center.z)
+
+
+# --- 移动相机函数定义 ---
+
+
+def move_camera_up(cam, step_size=1.0):
+    cam.location.z += step_size
+
+
+def move_camera_down(cam, step_size=1.0):
+    cam.location.z -= step_size
+
+
+def move_camera_left(cam, step_size=1.0):
+    cam.location.x -= step_size
+
+
+def move_camera_right(cam, step_size=1.0):
+    cam.location.x += step_size
+
+
+def move_camera_forward(cam, step_size=1.0):
+    cam.location.y += step_size
+
+
+def move_camera_backward(cam, step_size=1.0):
+    cam.location.y -= step_size
+
+
+# --- 旋转相机函数定义 ---
+
+
+def rotate_camera_up(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.x += angle_radians
+
+
+def rotate_camera_down(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.x -= angle_radians
+
+
+def rotate_camera_left(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.z += angle_radians
+
+
+def rotate_camera_right(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.z -= angle_radians
+
+
+def rotate_camera_clockwise(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.y += angle_radians  # 顺时针旋转为负方向
+
+
+def rotate_camera_counterclockwise(cam, angle_degrees=10):
+    angle_radians = math.radians(angle_degrees)
+    cam.rotation_euler.y -= angle_radians  # 逆时针旋转为正方向
+
+
+def get_animation_list_from_file_path():
+    all_animations = set()  # 初始化一个空集合 all_animations
+    for obj in bpy.data.objects:  # 遍历Blender场景中的所有对象
+        if obj.animation_data and obj.animation_data.action:
+            action = obj.animation_data.action
+            if not obj.animation_data.nla_tracks.get(action.name.split("_")[0]):
+                new_track = obj.animation_data.nla_tracks.new()
+                new_track.name = action.name.split("_")[0]
+                new_strip = new_track.strips.new(action.name, int(action.frame_start), action)
+            obj.animation_data.action = None
+        if obj.animation_data and obj.animation_data.nla_tracks:
+            all_animations.update([track.name for track in obj.animation_data.nla_tracks])
+
+    return all_animations
+
+
+def render_one_track(output_dir, track_name, initial_camera, target_camera, num_renders):
+    current_animation_output_dir = os.path.join(output_dir, track_name)
+
+    frame_start, frame_end = 10000000, -10000000
+    for obj in bpy.data.objects:
+        if obj.animation_data:
+            track = obj.animation_data.nla_tracks.get(track_name)
+            if track and track.strips:
+                frame_start = min(frame_start, min([strip.frame_start for strip in track.strips]))
+                frame_end = max(frame_end, max([strip.frame_end for strip in track.strips]))
+
+    frame_start, frame_end = int(frame_start), int(frame_end)
+
+    if frame_end - frame_start < 10:
+        os.removedirs(current_animation_output_dir)
+        return
+
+    for obj in bpy.data.objects:
+        if obj.animation_data:
+            for obj_track in obj.animation_data.nla_tracks:
+                obj_track.mute = obj_track.name != track_name
+
+    camera = update_camera(initial_camera, target_camera, 0, num_renders)
+    # for frame_idx in range(frame_start, frame_end):
+    for frame_idx in range(frame_start, num_renders + frame_start):
+        cycle_length = frame_end - frame_start + 1
+        current_frame = ((frame_idx - frame_start) % cycle_length) + frame_start
+        scene.frame_set(current_frame)
+        render_path = os.path.join(current_animation_output_dir, f"0static_{frame_idx:03d}.png")
+        scene.render.filepath = render_path
+        bpy.ops.render.render(write_still=True)
+
+        # 保存RT矩阵，相机坐标系和世界坐标系的外参
+        rt_matrix_camera, rt_matrix_world = get_3x4_RT_matrix_from_blender(camera)
+        rt_matrix_path_camera = os.path.join(current_animation_output_dir, f"0static_{frame_idx:03d}_camera.npy")
+        rt_matrix_path_world = os.path.join(current_animation_output_dir, f"0static_{frame_idx:03d}_world.npy")
+        np.save(rt_matrix_path_camera, rt_matrix_camera)
+        np.save(rt_matrix_path_world, rt_matrix_world)
+
+    # 进行多次渲染，根据num_renders指定的次数
+    for i, frame_idx in zip(range(num_renders), range(frame_start, num_renders + frame_start)):
+
+        camera = update_camera(initial_camera, target_camera, i, num_renders)
+
+        cycle_length = frame_end - frame_start + 1
+        current_frame = ((frame_idx - frame_start) % cycle_length) + frame_start
+        scene.frame_set(current_frame)
+        render_path = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}.png")
+        scene.render.filepath = render_path
+        bpy.ops.render.render(write_still=True)
+
+        # 保存RT矩阵，相机坐标系和世界坐标系的外参
+        rt_matrix_camera, rt_matrix_world = get_3x4_RT_matrix_from_blender(camera)
+        rt_matrix_path_camera = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}_camera.npy")
+        rt_matrix_path_world = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}_world.npy")
+        np.save(rt_matrix_path_camera, rt_matrix_camera)
+        np.save(rt_matrix_path_world, rt_matrix_world)
+
+
+def render_object_random(
     object_file: str,
     num_renders: int,
     only_northern_hemisphere: bool,
@@ -749,17 +994,18 @@ def render_object(
         load_object(object_file)
 
     # Set up cameras
-    cam = scene.objects["Camera"]
-    cam.data.lens = 35
-    cam.data.sensor_width = 32
+    cam = scene.objects["Camera"]  # 获取场景中的摄像机对象
+    cam.data.lens = 35  # 设置摄像机的镜头焦距为35mm
+    cam.data.sensor_width = 35  # 设置摄像机传感器的宽度为32mm
+    cam.data.sensor_height = 20
 
-    # Set up camera constraints
-    cam_constraint = cam.constraints.new(type="TRACK_TO")
-    cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
-    cam_constraint.up_axis = "UP_Y"
-    empty = bpy.data.objects.new("Empty", None)
-    scene.collection.objects.link(empty)
-    cam_constraint.target = empty
+    # 设置摄像机约束，使其始终指向一个空对象
+    cam_constraint = cam.constraints.new(type="TRACK_TO")  # 创建一个新类型为TRACK_TO的约束
+    cam_constraint.track_axis = "TRACK_NEGATIVE_Z"  # 设置摄像机的跟踪轴为负Z轴
+    cam_constraint.up_axis = "UP_Y"  # 设置摄像机的上方向为Y轴
+    empty = bpy.data.objects.new("Empty", None)  # 创建一个新的空对象，命名为"Empty"
+    scene.collection.objects.link(empty)  # 将空对象链接到当前场景中
+    cam_constraint.target = empty  # 将空对象设为摄像机约束的目标
 
     # Extract the metadata. This must be done before normalizing the scene to get
     # accurate bounding box information.
@@ -788,26 +1034,218 @@ def render_object(
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, sort_keys=True, indent=2)
 
-    # normalize the scene
+    # 规范化场景，确保对象和摄像机的位置、缩放等符合预期
     normalize_scene()
 
-    # randomize the lighting
+    # 随机化场景中的灯光设置，以增加渲染的多样性
     randomize_lighting()
 
-    # render the images
-    for i in range(num_renders):
-        # set camera
-        camera = randomize_camera(only_northern_hemisphere=only_northern_hemisphere)
+    all_animations = get_animation_list_from_file_path()
+    for track_name in all_animations:
+        os.makedirs(os.path.join(args.output_dir, track_name), exist_ok=True)
 
-        # render the image
-        render_path = os.path.join(output_dir, f"{i:03d}.png")
-        scene.render.filepath = render_path
-        bpy.ops.render.render(write_still=True)
+    # 随机设置摄像机的位置和方向
+    initial_camera = randomize_camera_position(only_northern_hemisphere=only_northern_hemisphere)
+    target_camera = randomize_camera_position(only_northern_hemisphere=only_northern_hemisphere)
 
-        # save camera RT matrix
-        rt_matrix = get_3x4_RT_matrix_from_blender(camera)
-        rt_matrix_path = os.path.join(output_dir, f"{i:03d}.npy")
-        np.save(rt_matrix_path, rt_matrix)
+    if all_animations:
+        for track_name in all_animations.copy():
+            render_one_track(output_dir, track_name, initial_camera, target_camera, num_renders)
+
+
+def render_with_movement_and_rotation(
+    object_file: str,
+    num_renders: int,
+    output_dir: str,
+    camera_initial_location: tuple = (10, 0, 10),
+    camera_direction: tuple = (-1, 0, -1),
+    movement_sequence: list = [],
+    rotation_sequence: list = [],
+    movement_step_size: float = 0.5,
+    rotation_angle_degrees: float = 5,
+    camera_initial_rotation: float = 0.0,
+) -> None:
+    """保存渲染的图像及其摄像机矩阵和对象元数据，结合移动和旋转。
+
+    Args:
+        object_file (str): 对象文件的路径。
+        num_renders (int): 要保存的对象渲染次数。
+        only_northern_hemisphere (bool): 是否仅渲染对象在北半球的部分。
+        output_dir (str): 渲染图像和元数据将保存到的目录路径。
+        camera_initial_location (tuple, optional): 相机的初始位置 (x, y, z)。默认是 (10, 0, 10)。
+        camera_direction (tuple, optional): 相机的固定朝向方向向量 (dx, dy, dz)。默认是 (-1, 0, -1)。
+        movement_sequence (list, optional): 渲染过程中每步要执行的移动指令列表。
+            可选值：'up', 'down', 'left', 'right', 'forward', 'backward'
+        rotation_sequence (list, optional): 渲染过程中每步要执行的旋转指令列表。
+            可选值：'rotate_up', 'rotate_down', 'rotate_left', 'rotate_right', 'rotate_clockwise', 'rotate_counterclockwise'
+        movement_step_size (float, optional): 移动步长。默认是0.5。
+        rotation_angle_degrees (float, optional): 旋转角度（度）。默认是5度。
+
+    Returns:
+        None
+    """
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 加载对象
+    if object_file.endswith(".blend"):
+        bpy.ops.object.mode_set(mode="OBJECT")
+        reset_cameras()
+        delete_invisible_objects()
+    else:
+        reset_scene()
+        load_object(object_file)
+
+    # 获取和设置摄像机
+    cam = bpy.data.objects.get("Camera")
+    if not cam:
+        raise ValueError("场景中不存在名为 'Camera' 的相机对象。")
+    cam.location = camera_initial_location
+    cam.data.lens = 35
+    cam.data.sensor_width = 35
+    cam.data.sensor_height = 20
+
+    # 设置相机朝向
+    direction_vector = mathutils.Vector(camera_direction).normalized()
+    rot_quat = direction_vector.to_track_quat('-Z', 'Y')
+    # rot_quat = direction_vector.to_track_quat('Z', '-Y')
+    cam.rotation_euler = rot_quat.to_euler()
+    angle_radians = math.radians(
+        camera_initial_rotation
+    )  # camera_initial_rotation为负，表示初始状态逆时针旋转指定度数；camera_initial_rotation为正，表示初始状态顺时针旋转指定度数
+    cam.rotation_euler.y += angle_radians  # 逆时针旋转为正方向
+
+    # 提取元数据
+    metadata_extractor = MetadataExtractor(object_path=object_file, scene=bpy.context.scene, bdata=bpy.data)
+    metadata = metadata_extractor.get_metadata()
+
+    # 删除非网格对象
+    if object_file.lower().endswith(".usdz"):
+        missing_textures = None
+    else:
+        missing_textures = delete_missing_textures()
+    metadata["missing_textures"] = missing_textures
+
+    # 应用随机颜色
+    if object_file.endswith(".stl") or object_file.endswith(".ply"):
+        assert len(bpy.context.selected_objects) == 1
+        rand_color = apply_single_random_color_to_all_objects()
+        metadata["random_color"] = rand_color
+    else:
+        metadata["random_color"] = None
+
+    # 保存元数据
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, sort_keys=True, indent=2)
+
+    # 规范化场景
+    normalize_scene()
+
+    # 随机化灯光
+    randomize_lighting()
+
+    all_animations = get_animation_list_from_file_path()
+    for track_name in all_animations:
+        os.makedirs(os.path.join(args.output_dir, track_name), exist_ok=True)
+
+    # print('all_animations', all_animations)
+
+    if all_animations:
+        for track_name in all_animations.copy():
+            cam.location = camera_initial_location
+            direction_vector = mathutils.Vector(camera_direction).normalized()
+            rot_quat = direction_vector.to_track_quat('-Z', 'Y')
+            cam.rotation_euler = rot_quat.to_euler()
+            angle_radians = math.radians(camera_initial_rotation)
+            cam.rotation_euler.y += angle_radians  # 逆时针旋转为正方向
+
+            current_animation_output_dir = os.path.join(output_dir, track_name)
+
+            frame_start, frame_end = 10000000, -10000000
+            for obj in bpy.data.objects:
+                if obj.animation_data:
+                    track = obj.animation_data.nla_tracks.get(track_name)
+                    if track and track.strips:
+                        frame_start = min(frame_start, min([strip.frame_start for strip in track.strips]))
+                        frame_end = max(frame_end, max([strip.frame_end for strip in track.strips]))
+
+            frame_start, frame_end = int(frame_start), int(frame_end)
+
+            # if frame_end - frame_start < 10:
+            #     os.removedirs(current_animation_output_dir)
+            #     return
+
+            for obj in bpy.data.objects:
+                if obj.animation_data:
+                    for obj_track in obj.animation_data.nla_tracks:
+                        obj_track.mute = obj_track.name != track_name
+
+            # for frame_idx in range(frame_start, frame_end):
+            for frame_idx in range(frame_start, num_renders + frame_start):
+                cycle_length = frame_end - frame_start + 1
+                current_frame = ((frame_idx - frame_start) % cycle_length) + frame_start
+                scene.frame_set(current_frame)
+                render_path = os.path.join(current_animation_output_dir, f"0staticshot_{frame_idx:03d}.png")
+                scene.render.filepath = render_path
+                bpy.ops.render.render(write_still=True)
+
+                # 保存RT矩阵，相机坐标系和世界坐标系的外参
+                rt_matrix_camera, rt_matrix_world = get_3x4_RT_matrix_from_blender(cam)
+                rt_matrix_path_camera = os.path.join(current_animation_output_dir, f"0staticshot_{frame_idx:03d}_camera.npy")
+                rt_matrix_path_world = os.path.join(current_animation_output_dir, f"0staticshot_{frame_idx:03d}_world.npy")
+                np.save(rt_matrix_path_camera, rt_matrix_camera)
+                np.save(rt_matrix_path_world, rt_matrix_world)
+
+            # 渲染循环
+            for i, frame_idx in zip(range(num_renders), range(frame_start, num_renders + frame_start)):
+
+                cycle_length = frame_end - frame_start + 1
+                current_frame = ((frame_idx - frame_start) % cycle_length) + frame_start
+                scene.frame_set(current_frame)
+                render_path = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}.png")
+                scene.render.filepath = render_path
+                bpy.ops.render.render(write_still=True)
+
+                # 保存RT矩阵，相机坐标系和世界坐标系的外参
+                rt_matrix_camera, rt_matrix_world = get_3x4_RT_matrix_from_blender(cam)
+                rt_matrix_path_camera = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}_camera.npy")
+                rt_matrix_path_world = os.path.join(current_animation_output_dir, f"1dynamic_{i:03d}_{frame_idx:03d}_world.npy")
+                np.save(rt_matrix_path_camera, rt_matrix_camera)
+                np.save(rt_matrix_path_world, rt_matrix_world)
+
+                # 执行移动
+                if i < len(movement_sequence):
+                    move_cmd = movement_sequence[i]
+                    if move_cmd == 'up':
+                        move_camera_up(cam, step_size=movement_step_size)
+                    elif move_cmd == 'down':
+                        move_camera_down(cam, step_size=movement_step_size)
+                    elif move_cmd == 'left':
+                        move_camera_left(cam, step_size=movement_step_size)
+                    elif move_cmd == 'right':
+                        move_camera_right(cam, step_size=movement_step_size)
+                    elif move_cmd == 'forward':
+                        move_camera_forward(cam, step_size=movement_step_size)
+                    elif move_cmd == 'backward':
+                        move_camera_backward(cam, step_size=movement_step_size)
+
+                # 执行旋转
+                if i < len(rotation_sequence):
+                    rotate_cmd = rotation_sequence[i]
+                    if rotate_cmd == 'rotate_up':
+                        rotate_camera_up(cam, angle_degrees=rotation_angle_degrees)
+                    elif rotate_cmd == 'rotate_down':
+                        rotate_camera_down(cam, angle_degrees=rotation_angle_degrees)
+                    elif rotate_cmd == 'rotate_left':
+                        rotate_camera_left(cam, angle_degrees=rotation_angle_degrees)
+                    elif rotate_cmd == 'rotate_right':
+                        rotate_camera_right(cam, angle_degrees=rotation_angle_degrees)
+                    elif rotate_cmd == 'rotate_clockwise':
+                        rotate_camera_clockwise(cam, angle_degrees=rotation_angle_degrees)
+                    elif rotate_cmd == 'rotate_counterclockwise':
+                        rotate_camera_counterclockwise(cam, angle_degrees=rotation_angle_degrees)
 
 
 if __name__ == "__main__":
@@ -817,6 +1255,15 @@ if __name__ == "__main__":
     parser.add_argument("--engine", type=str, default="BLENDER_EEVEE", choices=["CYCLES", "BLENDER_EEVEE"])
     parser.add_argument("--only_northern_hemisphere", action="store_true", help="Only render the northern hemisphere of the object.", default=False)
     parser.add_argument("--num_renders", type=int, default=12, help="Number of renders to save of the object.")
+    parser.add_argument("--camera_initial_location", type=str, default="(0, 0, 0)", help="")
+    parser.add_argument("--camera_direction", type=str, default="(0, 0, 0)", help="")
+    parser.add_argument("--camera_initial_rotation", type=float, default=0.0, help="")
+    parser.add_argument("--movement_sequence", type=str, default="[]", help="")
+    parser.add_argument("--rotation_sequence", type=str, default="[]", help="")
+    parser.add_argument("--movement_step_size", type=float, default=0.05, help="")
+    parser.add_argument("--rotation_angle_degrees", type=float, default=0.5, help="")
+    parser.add_argument("--random_or_custom", type=str, required=True, choices=["random", "custom"])
+
     argv = sys.argv[sys.argv.index("--") + 1 :]
     args = parser.parse_args(argv)
 
@@ -828,8 +1275,8 @@ if __name__ == "__main__":
     render.engine = args.engine
     render.image_settings.file_format = "PNG"
     render.image_settings.color_mode = "RGBA"
-    render.resolution_x = 512
-    render.resolution_y = 512
+    render.resolution_x = 672
+    render.resolution_y = 384
     render.resolution_percentage = 100
 
     # Set cycles settings
@@ -845,10 +1292,25 @@ if __name__ == "__main__":
     bpy.context.preferences.addons["cycles"].preferences.get_devices()
     bpy.context.preferences.addons["cycles"].preferences.compute_device_type = "CUDA"  # or "OPENCL"
 
-    # Render the images
-    render_object(
-        object_file=args.object_path,
-        num_renders=args.num_renders,
-        only_northern_hemisphere=args.only_northern_hemisphere,
-        output_dir=args.output_dir,
-    )
+    # print('args.random_or_custom: ', args.random_or_custom)
+
+    if args.random_or_custom == "custom":
+        render_with_movement_and_rotation(
+            object_file=args.object_path,
+            num_renders=args.num_renders,
+            output_dir=args.output_dir,
+            camera_initial_location=literal_eval(args.camera_initial_location),  # 相机起始位置，(X, Y, Z), (右, 上, 后)
+            camera_direction=literal_eval(args.camera_direction),  # 相机朝向方向向量
+            movement_sequence=literal_eval(args.movement_sequence),  # 移动指令序列
+            rotation_sequence=literal_eval(args.rotation_sequence),  # 旋转指令序列
+            movement_step_size=args.movement_step_size,  # 每步移动0.05单位
+            rotation_angle_degrees=args.rotation_angle_degrees,  # 每步旋转5度
+            camera_initial_rotation=args.camera_initial_rotation,
+        )
+    elif args.random_or_custom == "random":
+        render_object_random(
+            object_file=args.object_path,
+            num_renders=args.num_renders,
+            only_northern_hemisphere=args.only_northern_hemisphere,
+            output_dir=args.output_dir,
+        )
